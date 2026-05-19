@@ -1,80 +1,95 @@
-# KServe
-[![go.dev reference](https://img.shields.io/badge/go.dev-reference-007d9c?logo=go&logoColor=white)](https://pkg.go.dev/github.com/kserve/kserve)
-[![Go Report Card](https://goreportcard.com/badge/github.com/kserve/kserve)](https://goreportcard.com/report/github.com/kserve/kserve)
-[![OpenSSF Best Practices](https://bestpractices.coreinfrastructure.org/projects/6643/badge)](https://bestpractices.coreinfrastructure.org/projects/6643)
-[![Releases](https://img.shields.io/github/release-pre/kserve/kserve.svg?sort=semver)](https://github.com/kserve/kserve/releases)
-[![LICENSE](https://img.shields.io/github/license/kserve/kserve.svg)](https://github.com/kserve/kserve/blob/master/LICENSE)
-[![Slack Status](https://img.shields.io/badge/slack-join_chat-white.svg?logo=slack&style=social)](https://github.com/kserve/community/blob/main/README.md#questions-and-issues)
-[![Gurubase](https://img.shields.io/badge/Gurubase-Ask%20KServe%20Guru-006BFF)](https://gurubase.io/g/kserve)
+# Inference Serving
 
-KServe is a standardized distributed generative and predictive AI inference platform for scalable, multi-framework deployment on Kubernetes.
+Standardized model serving on Kubernetes — routing, autoscaling, canary, traffic splits.
 
-KServe is being [used by many organizations](https://kserve.github.io/website/docs/community/adopters) and is a [Cloud Native Computing Foundation (CNCF)](https://www.cncf.io/) incubating project.
+A brand-neutral fork in the [hanzo-ml](https://github.com/hanzo-ml)
+organization — the open-source ML lifecycle estate. Branding is
+consumed at runtime from a brand package via the
+[`@<org>/brand`](#brand-package) contract; the same code deploys under
+any white-label brand with zero source changes.
 
-For more details, visit the [KServe website](https://kserve.github.io/website/).
+## Brand package
 
-![KServe](/docs/diagrams/kserve_new.png)
+This fork imports brand configuration from a runtime brand package
+following the contract used across the open-source ML estate. Set
+`BRAND_PACKAGE` to the npm package name; the fork's frontend (where
+applicable) calls `loadBrand()` at boot to hydrate the singleton from
+that package's `brand.json`.
 
-### Why KServe?
+Available brand packages:
 
-Single platform that unifies Generative and Predictive AI inference on Kubernetes. Simple enough for quick deployments, yet powerful enough to handle enterprise-scale AI workloads with advanced features.
+| Package | Brand |
+|---|---|
+| `@hanzo/brand` | default / Hanzo AI |
+| `@luxfi/brand` | Lux Finance |
+| `@zooai/brand` | Zoo Labs |
+| `@osage/brand` | Osage |
+| `@parsdao/brand` | Pars DAO |
+| `@cyrusdao/brand` | Cyrus DAO |
+| `@onyx-plus/brand` | Onyx Plus |
+| `@migaprotocol/brand` | Miga Protocol |
+| `@vccross/brand` | VC Cross |
+| `@mlc/brand` | MLC |
+| `@zenlm/brand` | Zen LM |
 
-### Features
+Or any custom reseller package conforming to the same schema.
 
-**Generative AI**
-  * 🧮 **Optimized Backends**: Support for vLLM and llm-d for optimized performance for serving LLMs
-  * 📌 **Standardization**: OpenAI-compatible inference protocol for seamless integration with LLMs
-  * 🚅 **GPU Acceleration**: High-performance serving with GPU support and optimized memory management for large models
-  * 💾 **Model Caching**: Intelligent model caching to reduce loading times and improve response latency for frequently used models
-  * 🗂️ **KV Cache Offloading**: Advanced memory management with KV cache offloading to CPU/disk for handling longer sequences efficiently
-  * 📈 **Autoscaling**: Request-based autoscaling capabilities optimized for generative workload patterns
-  * 🔧 **Hugging Face Ready**: Native support for Hugging Face models with streamlined deployment workflows
+## Multi-tenant via IAM
 
-**Predictive AI**
-  * 🧮 **Multi-Framework**: Support for TensorFlow, PyTorch, scikit-learn, XGBoost, ONNX, and more
-  * 🔀 **Intelligent Routing**: Seamless request routing between predictor, transformer, and explainer components with automatic traffic management
-  * 🔄 **Advanced Deployments**: Canary rollouts, inference pipelines, and ensembles with InferenceGraph
-  * ⚡ **Autoscaling**: Request-based autoscaling with scale-to-zero for predictive workloads
-  * 🔍 **Model Explainability**: Built-in support for model explanations and feature attribution to understand prediction reasoning
-  * 📊 **Advanced Monitoring**: Enables payload logging, outlier detection, adversarial detection, and drift detection
-  * 💰 **Cost Efficient**: Scale-to-zero on expensive resources when not in use, reducing infrastructure costs
+Every request carries a JWT. The brand package's `iam` block specifies:
 
-### Learn More
-To learn more about KServe, how to use various supported features, and how to participate in the KServe community, 
-please follow the [KServe website documentation](https://kserve.github.io/website). 
-Additionally, we have compiled a list of [presentations and demos](https://kserve.github.io/website/docs/community/presentations) to dive through various details.
+- `issuer` — JWT issuer URL
+- `jwksUrl` — JWKS endpoint
+- `tenantClaim` — JWT claim with the org/tenant ID (default `org_id`)
+- `tenantHeader` — HTTP header that propagates the validated tenant
+  ID (default `X-Org-Id`)
 
-### :hammer_and_wrench: Installation
+The tenant ID scopes all storage, queries, and resource ownership.
+Cross-tenant access is forbidden by default.
 
-#### Standalone Installation
-- **[Standard Kubernetes Installation](https://kserve.github.io/website/docs/admin-guide/overview#raw-kubernetes-deployment)**: Compared to Serverless Installation, this is a more **lightweight** installation. However, this option does not support canary deployment and request based autoscaling with scale-to-zero.
-- **[Knative Installation](https://kserve.github.io/website/docs/admin-guide/overview#serverless-deployment)**: KServe by default installs Knative for **serverless deployment** for InferenceService.
-- **[ModelMesh Installation](https://kserve.github.io/website/docs/admin-guide/overview#modelmesh-deployment)**: You can optionally install ModelMesh to enable **high-scale**, **high-density** and **frequently-changing model serving** use cases. 
-- **[Quick Installation](https://kserve.github.io/website/docs/getting-started/quickstart-guide)**: Install KServe on your local machine.
+## Quick start (reseller deployment)
 
-#### Kubeflow Installation
-KServe is an important addon component of Kubeflow, please learn more from the [Kubeflow KServe documentation](https://www.kubeflow.org/docs/external-add-ons/kserve/kserve). Check out the following guides for running [on AWS](https://awslabs.github.io/kubeflow-manifests/main/docs/component-guides/kserve) or [on OpenShift Container Platform](https://github.com/kserve/kserve/blob/master/docs/OPENSHIFT_GUIDE.md).
+```bash
+export BRAND_PACKAGE="@<your-org>/brand"   # e.g. @luxfi/brand
+```
 
-### :flight_departure: [Create your first InferenceService](https://kserve.github.io/website/docs/getting-started/genai-first-isvc)
+The frontend (this fork's case: `pipelines` ships the React DAG UI;
+the other 7 are read-only reference forks) loads the brand at boot.
+The backend reads the brand package's `iam` block for JWKS + tenant
+configuration.
 
-### :bulb: [Roadmap](./ROADMAP.md)
+## Role
 
-### :blue_book: [InferenceService API Reference](https://kserve.github.io/website/docs/reference/crd-api)
+Read-only reference for the Rust operator's `Inference` CRD. Routes to the in-process Rust serving engine or external workers.
 
-### :toolbox: [Developer Guide](https://kserve.github.io/website/docs/developer-guide)
+The canonical control plane for the ML lifecycle estate is the Rust
+operator at [`hanzoai/operator`](https://github.com/hanzoai/operator).
+See [HIP-0109](https://github.com/hanzoai/HIPs/blob/main/HIPs/hip-0109-hanzo-ml-cloud-toolkit.md)
+for the lifecycle CRD set.
 
-### :writing_hand: [Contributor Guide](https://kserve.github.io/website/docs/developer-guide/contribution)
+## Upstream sync
 
-### :handshake: [Adopters](https://kserve.github.io/website/docs/community/adopters)
+This fork stays current with upstream via the GitHub merge-upstream
+API. No upstream code is modified in this fork; only the 5 markdown
+files at root are added.
 
-### Star History
+```bash
+gh api -X POST /repos/hanzo-ml/kserve/merge-upstream \
+  -f branch=master
+```
 
-[![Star History Chart](https://api.star-history.com/svg?repos=kserve/kserve&type=Date)](https://www.star-history.com/#kserve/kserve&Date)
+See [UPSTREAM_README.md](./UPSTREAM_README.md) for the original
+project documentation.
 
-### Contributors
+## License
 
-Thanks to all of our amazing contributors!
+Apache-2.0. See [NOTICE](./NOTICE) for attribution.
 
-<a href="https://github.com/kserve/kserve/graphs/contributors">
-  <img src="https://contrib.rocks/image?repo=kserve/kserve" />
-</a>
+## See also
+
+- [DESIGN.md](./DESIGN.md) — design system reference (mirrors the brand
+  package's design spec)
+- [BRAND.md](./BRAND.md) — brand package contract and reseller guide
+- [MULTI_TENANT.md](./MULTI_TENANT.md) — tenant isolation contract
+- [HANZO_CHANGES.md](./HANZO_CHANGES.md) — divergence from upstream
+- [HIP-0109 Hanzo ML Cloud Toolkit](https://github.com/hanzoai/HIPs/blob/main/HIPs/hip-0109-hanzo-ml-cloud-toolkit.md)
