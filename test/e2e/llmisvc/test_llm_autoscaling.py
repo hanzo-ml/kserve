@@ -331,16 +331,20 @@ def assert_metrics_pipeline_ready(actuator="hpa"):
             namespace=PROMETHEUS_NAMESPACE,
             label_selector="app.kubernetes.io/name=prometheus-adapter",
         )
-        running = [p for p in pods.items if p.status.phase == "Running"]
-        assert len(running) > 0, "No running Prometheus Adapter pods found"
+        running_names = [
+            p.metadata.name for p in pods.items if p.status.phase == "Running"
+        ]
+        assert running_names, "No running Prometheus Adapter pods found"
     elif actuator == "keda":
         v1 = client.CoreV1Api()
         pods = v1.list_namespaced_pod(
             namespace=KEDA_NAMESPACE,
             label_selector="app.kubernetes.io/name=keda-operator",
         )
-        running = [p for p in pods.items if p.status.phase == "Running"]
-        assert len(running) > 0, "No running KEDA operator pods found"
+        running_names = [
+            p.metadata.name for p in pods.items if p.status.phase == "Running"
+        ]
+        assert running_names, "No running KEDA operator pods found"
 
 
 def assert_wva_metric_exists(service_name, namespace=KSERVE_TEST_NAMESPACE):
@@ -418,6 +422,48 @@ def assert_lws_replicas(service_name, min_replicas, namespace=KSERVE_TEST_NAMESP
         )
 
     wait_for(_check, timeout=60, interval=5.0)
+
+
+# --- ScalingReady condition helpers ---
+
+
+def _get_llmisvc_condition(name, namespace, condition_type):
+    """Get a specific condition from LLMInferenceService status."""
+    api = client.CustomObjectsApi()
+    resource = api.get_namespaced_custom_object(
+        constants.KSERVE_GROUP,
+        "v1alpha2",
+        namespace,
+        KSERVE_PLURAL_LLMINFERENCESERVICE,
+        name,
+    )
+    conditions = resource.get("status", {}).get("conditions", [])
+    for cond in conditions:
+        if cond.get("type") == condition_type:
+            return cond
+    return None
+
+
+def assert_scaling_ready_condition(service_name, namespace=KSERVE_TEST_NAMESPACE):
+    """Verify the ScalingReady condition is present and True."""
+
+    def _check():
+        cond = _get_llmisvc_condition(service_name, namespace, "ScalingReady")
+        assert cond is not None, f"ScalingReady condition not found on {service_name}"
+        assert cond.get("status") == "True", (
+            f"ScalingReady status is {cond.get('status')} "
+            f"(reason={cond.get('reason')}), expected True"
+        )
+
+    wait_for(_check, timeout=180, interval=5.0)
+
+
+def assert_scaling_ready_absent(service_name, namespace=KSERVE_TEST_NAMESPACE):
+    """Verify the ScalingReady condition is absent from the LLMInferenceService."""
+    cond = _get_llmisvc_condition(service_name, namespace, "ScalingReady")
+    assert cond is None, (
+        f"ScalingReady condition should be absent on {service_name}, got: {cond}"
+    )
 
 
 # --- Common test lifecycle ---
@@ -507,6 +553,7 @@ def test_llm_autoscaling_hpa_deployment(test_case: TestCase):
         assert_wva_metric_exists(service_name)
         wait_for_pod_count(service_name, min_count=2, timeout=300)
         assert_hpa_active(service_name)
+        assert_scaling_ready_condition(service_name)
     finally:
         _cleanup(kserve_client, test_case)
 
@@ -571,6 +618,7 @@ def test_llm_autoscaling_keda_deployment(test_case: TestCase):
         assert_wva_metric_exists(service_name)
         wait_for_pod_count(service_name, min_count=2, timeout=300)
         assert_scaled_object_active(service_name)
+        assert_scaling_ready_condition(service_name)
     finally:
         _cleanup(kserve_client, test_case)
 
@@ -629,6 +677,7 @@ def test_llm_autoscaling_hpa_lws(test_case: TestCase):
         wait_for_pod_count(service_name, min_count=2, timeout=300)
         assert_hpa_active(service_name)
         assert_lws_replicas(service_name, min_replicas=1)
+        assert_scaling_ready_condition(service_name)
     finally:
         _cleanup(kserve_client, test_case)
 
@@ -687,6 +736,7 @@ def test_llm_autoscaling_keda_lws(test_case: TestCase):
         wait_for_pod_count(service_name, min_count=2, timeout=300)
         assert_scaled_object_active(service_name)
         assert_lws_replicas(service_name, min_replicas=1)
+        assert_scaling_ready_condition(service_name)
     finally:
         _cleanup(kserve_client, test_case)
 
@@ -736,6 +786,7 @@ def test_llm_autoscaling_prefill_hpa(test_case: TestCase):
 
         assert_scaling_resources_exist(service_name, actuator="hpa", prefill=False)
         assert_scaling_resources_exist(service_name, actuator="hpa", prefill=True)
+        assert_scaling_ready_condition(service_name)
     finally:
         _cleanup(kserve_client, test_case)
 
@@ -785,6 +836,7 @@ def test_llm_autoscaling_prefill_keda(test_case: TestCase):
 
         assert_scaling_resources_exist(service_name, actuator="keda", prefill=False)
         assert_scaling_resources_exist(service_name, actuator="keda", prefill=True)
+        assert_scaling_ready_condition(service_name)
     finally:
         _cleanup(kserve_client, test_case)
 
@@ -831,10 +883,9 @@ def test_llm_autoscaling_cleanup_hpa(test_case: TestCase):
     try:
         _create_and_wait(kserve_client, test_case)
         assert_scaling_resources_exist(service_name, actuator="hpa")
+        assert_scaling_ready_condition(service_name)
 
         # Remove the scaling baseRef; keep only non-scaling refs.
-        # Scaling comes from a LLMInferenceServiceConfig, so patching inline
-        # spec.scaling=null won't override it — we must remove the baseRef.
         base_refs = test_case.llm_service.spec["baseRefs"]
         non_scaling_refs = [ref for ref in base_refs if "scaling" not in ref["name"]]
         patch_llmisvc(
@@ -849,6 +900,7 @@ def test_llm_autoscaling_cleanup_hpa(test_case: TestCase):
         )
 
         assert_scaling_resources_deleted(service_name, actuator="hpa")
+        assert_scaling_ready_absent(service_name)
     finally:
         _cleanup(kserve_client, test_case)
 
@@ -895,6 +947,7 @@ def test_llm_autoscaling_cleanup_keda(test_case: TestCase):
     try:
         _create_and_wait(kserve_client, test_case)
         assert_scaling_resources_exist(service_name, actuator="keda")
+        assert_scaling_ready_condition(service_name)
 
         base_refs = test_case.llm_service.spec["baseRefs"]
         non_scaling_refs = [ref for ref in base_refs if "scaling" not in ref["name"]]
@@ -910,6 +963,7 @@ def test_llm_autoscaling_cleanup_keda(test_case: TestCase):
         )
 
         assert_scaling_resources_deleted(service_name, actuator="keda")
+        assert_scaling_ready_absent(service_name)
     finally:
         _cleanup(kserve_client, test_case)
 
@@ -956,6 +1010,7 @@ def test_llm_autoscaling_stop_hpa(test_case: TestCase):
     try:
         _create_and_wait(kserve_client, test_case)
         assert_scaling_resources_exist(service_name, actuator="hpa")
+        assert_scaling_ready_condition(service_name)
 
         patch_llmisvc(
             kserve_client,
@@ -970,6 +1025,7 @@ def test_llm_autoscaling_stop_hpa(test_case: TestCase):
         )
 
         assert_scaling_resources_deleted(service_name, actuator="hpa")
+        assert_scaling_ready_absent(service_name)
     finally:
         _cleanup(kserve_client, test_case)
 
@@ -1016,6 +1072,7 @@ def test_llm_autoscaling_stop_keda(test_case: TestCase):
     try:
         _create_and_wait(kserve_client, test_case)
         assert_scaling_resources_exist(service_name, actuator="keda")
+        assert_scaling_ready_condition(service_name)
 
         patch_llmisvc(
             kserve_client,
@@ -1030,6 +1087,7 @@ def test_llm_autoscaling_stop_keda(test_case: TestCase):
         )
 
         assert_scaling_resources_deleted(service_name, actuator="keda")
+        assert_scaling_ready_absent(service_name)
     finally:
         _cleanup(kserve_client, test_case)
 

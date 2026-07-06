@@ -18,6 +18,7 @@ package llmisvc
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	"k8s.io/client-go/kubernetes"
@@ -40,6 +41,7 @@ import (
 	autoscalingv2 "k8s.io/api/autoscaling/v2"
 	corev1 "k8s.io/api/core/v1"
 	netv1 "k8s.io/api/networking/v1"
+	resourcev1 "k8s.io/api/resource/v1"
 
 	"k8s.io/client-go/tools/record"
 	"k8s.io/client-go/util/retry"
@@ -53,8 +55,9 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 	igwapi "sigs.k8s.io/gateway-api-inference-extension/api/v1"
-	igwapiv1alpha2 "sigs.k8s.io/gateway-api-inference-extension/apix/v1alpha2"
 	gwapiv1 "sigs.k8s.io/gateway-api/apis/v1"
+
+	igwapiv1alpha2 "github.com/kserve/kserve/pkg/apis/gie/v1alpha2pool"
 
 	kedav1alpha1 "github.com/kedacore/keda/v2/apis/keda/v1alpha1"
 	wvav1alpha1 "github.com/llm-d/llm-d-workload-variant-autoscaler/api/v1alpha1"
@@ -75,6 +78,48 @@ var ChildResourcesLabelSelector = metav1.LabelSelector{
 // childResourcesPredicate filters events to only those from resources owned by LLMInferenceService
 // This prevents unnecessary reconciliation triggers from unrelated resources
 var childResourcesPredicate, _ = predicate.LabelSelectorPredicate(ChildResourcesLabelSelector)
+
+var (
+	inferenceServiceConfigMapPredicate = predicate.Funcs{
+		CreateFunc: func(e event.CreateEvent) bool {
+			return isInferenceServiceConfigMap(e.Object)
+		},
+		DeleteFunc: func(e event.DeleteEvent) bool {
+			return isInferenceServiceConfigMap(e.Object)
+		},
+		UpdateFunc: func(e event.UpdateEvent) bool {
+			return isInferenceServiceConfigMap(e.ObjectNew) && inferenceServiceConfigChanged(e.ObjectOld, e.ObjectNew)
+		},
+		GenericFunc: func(e event.GenericEvent) bool {
+			return isInferenceServiceConfigMap(e.Object)
+		},
+	}
+	nonInferenceServiceConfigMapPredicate = predicate.NewPredicateFuncs(func(obj client.Object) bool {
+		return !isInferenceServiceConfigMap(obj)
+	})
+)
+
+func isInferenceServiceConfigMap(obj client.Object) bool {
+	return obj.GetNamespace() == constants.KServeNamespace &&
+		obj.GetName() == constants.InferenceServiceConfigMapName
+}
+
+func inferenceServiceConfigChanged(oldObj, newObj client.Object) bool {
+	oldConfigMap := oldObj.(*corev1.ConfigMap)
+	newConfigMap := newObj.(*corev1.ConfigMap)
+
+	oldConfig, oldErr := toConfig(oldConfigMap)
+	newConfig, newErr := toConfig(newConfigMap)
+	if oldErr != nil || newErr != nil {
+		ctrl.Log.WithName("LLMInferenceService").Error(
+			errors.Join(oldErr, newErr),
+			"Failed to parse inferenceservice-config, falling back to raw comparison",
+		)
+		return !equality.Semantic.DeepEqual(oldConfigMap.Data, newConfigMap.Data)
+	}
+
+	return !equality.Semantic.DeepEqual(oldConfig, newConfig)
+}
 
 // LLMInferenceServiceState describes the readiness of the LLMInferenceService.
 type LLMInferenceServiceState string
@@ -108,6 +153,7 @@ type LLMISVCReconciler struct {
 //+kubebuilder:rbac:groups=gateway.networking.k8s.io,resources=httproutes;gateways;gatewayclasses,verbs=get;list;watch;create;update;patch;delete
 //+kubebuilder:rbac:groups=inference.networking.x-k8s.io,resources=inferencepools;inferenceobjectives;inferencemodels;inferencemodelrewrites;inferencepoolimports,verbs=get;list;watch;create;update;patch;delete
 //+kubebuilder:rbac:groups=inference.networking.k8s.io,resources=inferencepools;inferenceobjectives;inferencemodels,verbs=get;list;watch;create;update;patch;delete
+//+kubebuilder:rbac:groups=resource.k8s.io,resources=resourceclaims;resourceclaimtemplates,verbs=get;list;watch;create;update;patch;delete
 //+kubebuilder:rbac:groups=core,resources=pods,verbs=get;list;watch
 //+kubebuilder:rbac:groups=core,resources=serviceaccounts,verbs=get;list;watch;create;update;patch;delete
 //+kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=roles;rolebindings;clusterrolebindings,verbs=get;list;watch;create;update;patch;delete
@@ -202,9 +248,8 @@ func (r *LLMISVCReconciler) reconcile(ctx context.Context, llmSvc *v1alpha2.LLMI
 	logger := log.FromContext(ctx).WithName("reconcile")
 	ctx = log.IntoContext(ctx, logger)
 
-	// Load global configuration from KServe configmap
-	// TODO(ctrl): add watch on CfgMap with predicate and cache tuning to trigger reconcile when it changes
-	config, configErr := LoadConfig(ctx, r.Clientset)
+	// Load global configuration from KServe configmap.
+	config, configErr := r.loadConfig(ctx)
 	if configErr != nil {
 		return fmt.Errorf("failed to load ingress config: %w", configErr)
 	}
@@ -224,7 +269,7 @@ func (r *LLMISVCReconciler) reconcile(ctx context.Context, llmSvc *v1alpha2.LLMI
 		return fmt.Errorf("failed to reconcile workload: %w", err)
 	}
 
-	if err := r.reconcileRouter(ctx, llmSvc); err != nil {
+	if err := r.reconcileRouter(ctx, llmSvc, config); err != nil {
 		return fmt.Errorf("failed to reconcile networking: %w", err)
 	}
 
@@ -329,12 +374,13 @@ func (r *LLMISVCReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Owns(&corev1.Secret{}, builder.WithPredicates(childResourcesPredicate)).
 		Owns(&corev1.Service{}, builder.WithPredicates(childResourcesPredicate)).
 		Owns(&autoscalingv2.HorizontalPodAutoscaler{}, builder.WithPredicates(childResourcesPredicate)).
-		Watches(&corev1.ConfigMap{}, r.enqueueOnConfigMapChange(logger)).
+		Watches(&corev1.ConfigMap{}, r.enqueueOnConfigMapChange(logger), builder.WithPredicates(nonInferenceServiceConfigMapPredicate)).
+		Watches(&corev1.ConfigMap{}, r.enqueueOnInferenceServiceConfigMapChange(logger), builder.WithPredicates(inferenceServiceConfigMapPredicate)).
 		Watches(&corev1.Pod{},
 			handler.EnqueueRequestsFromMapFunc(r.EnqueueOnLLMInferenceServicePods),
 			builder.WithPredicates(PodStatusPredicate()))
 
-	if err := extendControllerSetup(mgr, b); err != nil {
+	if err := r.extendControllerSetup(mgr, b); err != nil {
 		return fmt.Errorf("failed to extend controller setup: %w", err)
 	}
 
@@ -368,6 +414,10 @@ func (r *LLMISVCReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		b = b.Owns(&lwsapi.LeaderWorkerSet{}, builder.WithPredicates(childResourcesPredicate))
 	}
 
+	if ok, err := utils.IsCrdAvailable(mgr.GetConfig(), resourcev1.SchemeGroupVersion.String(), "ResourceClaimTemplate"); ok && err == nil {
+		b = b.Owns(&resourcev1.ResourceClaimTemplate{}, builder.WithPredicates(childResourcesPredicate))
+	}
+
 	return b.Complete(r)
 }
 
@@ -381,7 +431,7 @@ func (r *LLMISVCReconciler) enqueueOnGatewayChange(logger logr.Logger) handler.E
 
 		listNamespace := corev1.NamespaceAll
 
-		cfg, err := LoadConfig(ctx, r.Clientset)
+		cfg, err := r.loadConfig(ctx)
 		if err != nil {
 			logger.Error(err, "Failed to load config")
 			return reqs
@@ -389,65 +439,58 @@ func (r *LLMISVCReconciler) enqueueOnGatewayChange(logger logr.Logger) handler.E
 
 		// When a Gateway is modified, we need to find all LLMInferenceService instances that might
 		// depend on it and trigger their reconciliation.
-		// Use pagination to handle large numbers of services efficiently
-		continueToken := ""
-		for {
-			llmSvcList := &v1alpha2.LLMInferenceServiceList{}
-			if err := r.List(ctx, llmSvcList, &client.ListOptions{Namespace: listNamespace, Continue: continueToken}); err != nil {
-				logger.Error(err, "Failed to list LLMInferenceService")
-				return reqs
+		llmSvcList := &v1alpha2.LLMInferenceServiceList{}
+		if err := r.List(ctx, llmSvcList, &client.ListOptions{Namespace: listNamespace}); err != nil {
+			logger.Error(err, "Failed to list LLMInferenceService")
+			return reqs
+		}
+		for _, llmSvc := range llmSvcList.Items {
+			if hasRoutingGatewayRef(&llmSvc, gwapiv1.ObjectName(sub.Name), gwapiv1.Namespace(sub.Namespace)) {
+				reqs = append(reqs, reconcile.Request{NamespacedName: types.NamespacedName{
+					Namespace: llmSvc.Namespace,
+					Name:      llmSvc.Name,
+				}})
+				continue // skip the expensive combineBaseRefsConfig fallback
 			}
-			for _, llmSvc := range llmSvcList.Items {
-				if hasRoutingGatewayRef(&llmSvc, gwapiv1.ObjectName(sub.Name), gwapiv1.Namespace(sub.Namespace)) {
+
+			// Fallback: service created before status.routing was introduced.
+			// Use the old derivation path until it reconciles and populates status.
+			llmSvcCopy := llmSvc.DeepCopy()
+			result, err := r.combineBaseRefsConfig(ctx, llmSvcCopy, cfg)
+			if err != nil {
+				logger.Error(err, "Failed to combine base refs config", "llmSvc", llmSvc.Name)
+				continue
+			}
+
+			combinedCfg := result.Config.Spec
+
+			// Skip services that don't use gateways
+			if combinedCfg.Router == nil || combinedCfg.Router.Gateway == nil {
+				continue
+			}
+
+			// Check if service uses the global default gateway
+			if !combinedCfg.Router.Gateway.HasRefs() && sub.Name == cfg.IngressGatewayName && sub.Namespace == cfg.IngressGatewayNamespace {
+				reqs = append(reqs, reconcile.Request{NamespacedName: types.NamespacedName{
+					Namespace: llmSvc.Namespace,
+					Name:      llmSvc.Name,
+				}})
+				continue
+			}
+
+			// Check if service explicitly references this gateway
+			for _, ref := range combinedCfg.Router.Gateway.Refs {
+				refNamespace := string(ref.Namespace)
+				if refNamespace == "" {
+					refNamespace = llmSvc.Namespace
+				}
+				if string(ref.Name) == sub.Name && refNamespace == sub.Namespace {
 					reqs = append(reqs, reconcile.Request{NamespacedName: types.NamespacedName{
 						Namespace: llmSvc.Namespace,
 						Name:      llmSvc.Name,
 					}})
-					continue // skip the expensive combineBaseRefsConfig fallback
-				}
-
-				// Fallback: service created before status.routing was introduced.
-				// Use the old derivation path until it reconciles and populates status.
-				llmSvcCopy := llmSvc.DeepCopy()
-				combinedCfg, err := r.combineBaseRefsConfig(ctx, llmSvcCopy, cfg)
-				if err != nil {
-					logger.Error(err, "Failed to combine base refs config", "llmSvc", llmSvc.Name)
-					continue
-				}
-
-				// Skip services that don't use gateways
-				if combinedCfg.Spec.Router == nil || combinedCfg.Spec.Router.Gateway == nil {
-					continue
-				}
-
-				// Check if service uses the global default gateway
-				if !combinedCfg.Spec.Router.Gateway.HasRefs() && sub.Name == cfg.IngressGatewayName && sub.Namespace == cfg.IngressGatewayNamespace {
-					reqs = append(reqs, reconcile.Request{NamespacedName: types.NamespacedName{
-						Namespace: llmSvc.Namespace,
-						Name:      llmSvc.Name,
-					}})
-					continue
-				}
-
-				// Check if service explicitly references this gateway
-				for _, ref := range combinedCfg.Spec.Router.Gateway.Refs {
-					refNamespace := string(ref.Namespace)
-					if refNamespace == "" {
-						refNamespace = llmSvc.Namespace
-					}
-					if string(ref.Name) == sub.Name && refNamespace == sub.Namespace {
-						reqs = append(reqs, reconcile.Request{NamespacedName: types.NamespacedName{
-							Namespace: llmSvc.Namespace,
-							Name:      llmSvc.Name,
-						}})
-					}
 				}
 			}
-
-			if llmSvcList.Continue == "" {
-				break
-			}
-			continueToken = llmSvcList.Continue
 		}
 
 		return reqs
@@ -464,7 +507,7 @@ func (r *LLMISVCReconciler) enqueueOnHttpRouteChange(logger logr.Logger) handler
 
 		listNamespace := corev1.NamespaceAll
 
-		cfg, err := LoadConfig(ctx, r.Clientset)
+		cfg, err := r.loadConfig(ctx)
 		if err != nil {
 			logger.Error(err, "Failed to load config")
 			return reqs
@@ -472,53 +515,46 @@ func (r *LLMISVCReconciler) enqueueOnHttpRouteChange(logger logr.Logger) handler
 
 		// When an HTTPRoute is modified, we need to find all LLMInferenceService instances that might
 		// depend on it and trigger their reconciliation.
-		// Use pagination to handle large numbers of services efficiently
-		continueToken := ""
-		for {
-			llmSvcList := &v1alpha2.LLMInferenceServiceList{}
-			if err := r.List(ctx, llmSvcList, &client.ListOptions{Namespace: listNamespace, Continue: continueToken}); err != nil {
-				logger.Error(err, "Failed to list LLMInferenceService")
-				return reqs
+		llmSvcList := &v1alpha2.LLMInferenceServiceList{}
+		if err := r.List(ctx, llmSvcList, &client.ListOptions{Namespace: listNamespace}); err != nil {
+			logger.Error(err, "Failed to list LLMInferenceService")
+			return reqs
+		}
+		for _, llmSvc := range llmSvcList.Items {
+			if hasRoutingHTTPRouteRef(&llmSvc, gwapiv1.ObjectName(sub.Name), sub.Namespace) {
+				reqs = append(reqs, reconcile.Request{NamespacedName: types.NamespacedName{
+					Namespace: llmSvc.Namespace,
+					Name:      llmSvc.Name,
+				}})
+				continue
 			}
-			for _, llmSvc := range llmSvcList.Items {
-				if hasRoutingHTTPRouteRef(&llmSvc, gwapiv1.ObjectName(sub.Name), sub.Namespace) {
+
+			// Fallback: service created before status.routing was introduced.
+			// Use the old derivation path until it reconciles and populates status.
+			llmSvcCopy := llmSvc.DeepCopy()
+			result, err := r.combineBaseRefsConfig(ctx, llmSvcCopy, cfg)
+			if err != nil {
+				logger.Error(err, "Failed to combine base refs config", "llmSvc", llmSvc.Name)
+				continue
+			}
+
+			combinedCfg := result.Config.Spec
+
+			// Skip services that don't use HTTPRoute refs
+			if combinedCfg.Router == nil || combinedCfg.Router.Route == nil || !combinedCfg.Router.Route.HTTP.HasRefs() {
+				continue
+			}
+
+			// Check if service explicitly references this HTTPRoute
+			for _, ref := range combinedCfg.Router.Route.HTTP.Refs {
+				if ref.Name == sub.Name && sub.Namespace == llmSvc.Namespace {
 					reqs = append(reqs, reconcile.Request{NamespacedName: types.NamespacedName{
 						Namespace: llmSvc.Namespace,
 						Name:      llmSvc.Name,
 					}})
-					continue
-				}
-
-				// Fallback: service created before status.routing was introduced.
-				// Use the old derivation path until it reconciles and populates status.
-				llmSvcCopy := llmSvc.DeepCopy()
-				combinedCfg, err := r.combineBaseRefsConfig(ctx, llmSvcCopy, cfg)
-				if err != nil {
-					logger.Error(err, "Failed to combine base refs config", "llmSvc", llmSvc.Name)
-					continue
-				}
-
-				// Skip services that don't use HTTPRoute refs
-				if combinedCfg.Spec.Router == nil || combinedCfg.Spec.Router.Route == nil || !combinedCfg.Spec.Router.Route.HTTP.HasRefs() {
-					continue
-				}
-
-				// Check if service explicitly references this HTTPRoute
-				for _, ref := range combinedCfg.Spec.Router.Route.HTTP.Refs {
-					if ref.Name == sub.Name && sub.Namespace == llmSvc.Namespace {
-						reqs = append(reqs, reconcile.Request{NamespacedName: types.NamespacedName{
-							Namespace: llmSvc.Namespace,
-							Name:      llmSvc.Name,
-						}})
-						break
-					}
+					break
 				}
 			}
-
-			if llmSvcList.Continue == "" {
-				break
-			}
-			continueToken = llmSvcList.Continue
 		}
 
 		return reqs
@@ -536,7 +572,7 @@ func (r *LLMISVCReconciler) enqueueOnInferencePoolChange(logger logr.Logger) han
 		reqs := make([]reconcile.Request, 0, 2)
 		listNamespace := sub.GetNamespace()
 
-		cfg, err := LoadConfig(ctx, r.Clientset)
+		cfg, err := r.loadConfig(ctx)
 		if err != nil {
 			logger.Error(err, "Failed to load config")
 			return reqs
@@ -544,48 +580,41 @@ func (r *LLMISVCReconciler) enqueueOnInferencePoolChange(logger logr.Logger) han
 
 		// When an InferencePool is modified, we need to find all LLMInferenceService instances that might
 		// depend on it through scheduler.pool.ref and trigger their reconciliation.
-		// Use pagination to handle large numbers of services efficiently.
-		continueToken := ""
-		for {
-			llmSvcList := &v1alpha2.LLMInferenceServiceList{}
-			if err := r.List(ctx, llmSvcList, &client.ListOptions{Namespace: listNamespace, Continue: continueToken}); err != nil {
-				logger.Error(err, "Failed to list LLMInferenceService")
-				return reqs
-			}
-			for _, llmSvc := range llmSvcList.Items {
-				llmSvcCopy := llmSvc.DeepCopy()
-				combinedCfg, err := r.combineBaseRefsConfig(ctx, llmSvcCopy, cfg)
-				if err != nil {
-					logger.Error(err, "Failed to combine base refs config", "llmSvc", llmSvc.Name)
-					continue
-				}
-
-				if combinedCfg.Spec.Router == nil ||
-					combinedCfg.Spec.Router.Scheduler == nil ||
-					combinedCfg.Spec.Router.Scheduler.Pool == nil ||
-					combinedCfg.Spec.Router.Scheduler.Pool.Ref == nil ||
-					combinedCfg.Spec.Router.Scheduler.Pool.Ref.Name != sub.GetName() {
-					continue
-				}
-
-				reqs = append(reqs, reconcile.Request{NamespacedName: types.NamespacedName{
-					Namespace: llmSvc.Namespace,
-					Name:      llmSvc.Name,
-				}})
+		llmSvcList := &v1alpha2.LLMInferenceServiceList{}
+		if err := r.List(ctx, llmSvcList, &client.ListOptions{Namespace: listNamespace}); err != nil {
+			logger.Error(err, "Failed to list LLMInferenceService")
+			return reqs
+		}
+		for _, llmSvc := range llmSvcList.Items {
+			llmSvcCopy := llmSvc.DeepCopy()
+			result, err := r.combineBaseRefsConfig(ctx, llmSvcCopy, cfg)
+			if err != nil {
+				logger.Error(err, "Failed to combine base refs config", "llmSvc", llmSvc.Name)
+				continue
 			}
 
-			if llmSvcList.Continue == "" {
-				break
+			combinedCfg := result.Config.Spec
+			if combinedCfg.Router == nil ||
+				combinedCfg.Router.Scheduler == nil ||
+				combinedCfg.Router.Scheduler.Pool == nil ||
+				combinedCfg.Router.Scheduler.Pool.Ref == nil ||
+				combinedCfg.Router.Scheduler.Pool.Ref.Name != sub.GetName() {
+				continue
 			}
-			continueToken = llmSvcList.Continue
+
+			reqs = append(reqs, reconcile.Request{NamespacedName: types.NamespacedName{
+				Namespace: llmSvc.Namespace,
+				Name:      llmSvc.Name,
+			}})
 		}
 
 		return reqs
 	})
 }
 
-// enqueueOnLLMInferenceServiceConfigChange creates an event handler that triggers reconciliation of LLMInferenceServices
-// when a referenced LLMInferenceServiceConfig changes. This ensures services are updated when their base configs change.
+// enqueueOnLLMInferenceServiceConfigChange triggers reconciliation of every LLMInferenceService
+// that used (or may use) the changed config - matched via status.appliedConfigs, spec.baseRefs,
+// or well-known config membership.
 func (r *LLMISVCReconciler) enqueueOnLLMInferenceServiceConfigChange(logger logr.Logger) handler.EventHandler {
 	logger = logger.WithName("enqueueOnLLMInferenceServiceConfigChange")
 	return handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, object client.Object) []reconcile.Request {
@@ -599,39 +628,34 @@ func (r *LLMISVCReconciler) enqueueOnLLMInferenceServiceConfigChange(logger logr
 			listNamespace = corev1.NamespaceAll
 		}
 
-		// When an LLMInferenceServiceConfig is modified, we need to find all LLMInferenceService instances that might
-		// depend on it and trigger their reconciliation.
-		continueToken := ""
-		for {
-			llmSvcList := &v1alpha2.LLMInferenceServiceList{}
-			if err := r.List(ctx, llmSvcList, &client.ListOptions{Namespace: listNamespace, Continue: continueToken}); err != nil {
-				logger.Error(err, "Failed to list LLMInferenceService")
-				return reqs
-			}
-			for _, llmSvc := range llmSvcList.Items {
-				// Check if this is a well-known config template that services automatically inherit
-				if WellKnownDefaultConfigs.Has(sub.Name) && (sub.Namespace == constants.KServeNamespace || sub.Namespace == llmSvc.Namespace) {
-					reqs = append(reqs, reconcile.Request{NamespacedName: types.NamespacedName{
-						Namespace: llmSvc.Namespace,
-						Name:      llmSvc.Name,
-					}})
-					continue
-				}
-
-				// Check if service explicitly references this config or uses it via versioned config resolution
-				if llmSvc.IsUsingLLMInferenceServiceConfig(sub.Name) {
-					reqs = append(reqs, reconcile.Request{NamespacedName: types.NamespacedName{
-						Namespace: llmSvc.Namespace,
-						Name:      llmSvc.Name,
-					}})
-					continue
-				}
+		// Find all LLMInferenceService instances that depend on (or may depend on) this config.
+		llmSvcList := &v1alpha2.LLMInferenceServiceList{}
+		if err := r.List(ctx, llmSvcList, &client.ListOptions{Namespace: listNamespace}); err != nil {
+			logger.Error(err, "Failed to list LLMInferenceService")
+			return reqs
+		}
+		for _, llmSvc := range llmSvcList.Items {
+			// Check status.appliedConfigs first (populated on success, retained
+			// when stopped), then fall back to annotations/baseRefs.
+			if llmSvc.IsUsingLLMInferenceServiceConfig(sub.Name) {
+				reqs = append(reqs, reconcile.Request{NamespacedName: types.NamespacedName{
+					Namespace: llmSvc.Namespace,
+					Name:      llmSvc.Name,
+				}})
+				continue
 			}
 
-			if llmSvcList.Continue == "" {
-				break
+			// Fallback when appliedConfigs is empty (not yet reconciled, or
+			// cleared after a config-merge error): enqueue if the changed
+			// config is a well-known default that could apply to this service.
+			if len(llmSvc.Status.AppliedConfigRefs) == 0 &&
+				WellKnownDefaultConfigs.Has(sub.Name) &&
+				(sub.Namespace == constants.KServeNamespace || sub.Namespace == llmSvc.Namespace) {
+				reqs = append(reqs, reconcile.Request{NamespacedName: types.NamespacedName{
+					Namespace: llmSvc.Namespace,
+					Name:      llmSvc.Name,
+				}})
 			}
-			continueToken = llmSvcList.Continue
 		}
 
 		return reqs
@@ -678,15 +702,10 @@ func (r *LLMISVCReconciler) enqueueOnConfigMapChange(logger logr.Logger) handler
 
 		listNamespace := sub.GetNamespace()
 
-		cfg, err := LoadConfig(ctx, r.Clientset)
+		cfg, err := r.loadConfig(ctx)
 		if err != nil {
 			logger.Error(err, "Failed to load config")
 			return reqs
-		}
-
-		// System namespace configs are global and can affect services in any namespace
-		if sub.Namespace == constants.KServeNamespace {
-			listNamespace = corev1.NamespaceAll
 		}
 
 		// When a ConfigMap is modified, we need to find all LLMInferenceService instances that might
@@ -699,20 +718,47 @@ func (r *LLMISVCReconciler) enqueueOnConfigMapChange(logger logr.Logger) handler
 
 		for _, llmSvc := range llmSvcList.Items {
 			// Use WithSkipClearSchedulerConfigRef to preserve the Ref for matching
-			resolved, err := r.combineBaseRefsConfig(ctx, &llmSvc, cfg, WithSkipClearSchedulerConfigRef())
+			result, err := r.combineBaseRefsConfig(ctx, &llmSvc, cfg, WithSkipClearSchedulerConfigRef())
 			if err != nil {
 				logger.Error(err, "Failed to combine baseRefs config", "namespace", llmSvc.Namespace, "name", llmSvc.Name)
 				continue
 			}
 
-			if resolved.Spec.Router == nil ||
-				resolved.Spec.Router.Scheduler == nil ||
-				resolved.Spec.Router.Scheduler.Config == nil ||
-				resolved.Spec.Router.Scheduler.Config.Ref == nil ||
-				resolved.Spec.Router.Scheduler.Config.Ref.Name != sub.Name {
+			combinedCfg := result.Config.Spec
+
+			if combinedCfg.Router == nil ||
+				combinedCfg.Router.Scheduler == nil ||
+				combinedCfg.Router.Scheduler.Config == nil ||
+				combinedCfg.Router.Scheduler.Config.Ref == nil ||
+				combinedCfg.Router.Scheduler.Config.Ref.Name != sub.Name {
 				continue
 			}
 
+			reqs = append(reqs, reconcile.Request{NamespacedName: types.NamespacedName{
+				Namespace: llmSvc.Namespace,
+				Name:      llmSvc.Name,
+			}})
+		}
+
+		return reqs
+	})
+}
+
+func (r *LLMISVCReconciler) enqueueOnInferenceServiceConfigMapChange(logger logr.Logger) handler.EventHandler {
+	logger = logger.WithName("enqueueOnInferenceServiceConfigMapChange")
+	return handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, object client.Object) []reconcile.Request {
+		reqs := make([]reconcile.Request, 0)
+		if !isInferenceServiceConfigMap(object) {
+			return reqs
+		}
+
+		llmSvcList := &v1alpha2.LLMInferenceServiceList{}
+		if err := r.List(ctx, llmSvcList, &client.ListOptions{Namespace: corev1.NamespaceAll}); err != nil {
+			logger.Error(err, "Failed to list LLMInferenceService")
+			return reqs
+		}
+
+		for _, llmSvc := range llmSvcList.Items {
 			reqs = append(reqs, reconcile.Request{NamespacedName: types.NamespacedName{
 				Namespace: llmSvc.Namespace,
 				Name:      llmSvc.Name,
