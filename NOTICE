@@ -1,0 +1,17 @@
+KServe
+Copyright The KServe Authors
+
+This product includes software developed at
+The KServe Authors -- https://github.com/kserve/kserve
+
+Licensed under the Apache License, Version 2.0. The full text is in LICENSE,
+and a copy is available at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Fork maintained by Hanzo AI -- https://hanzo.ai
+
+This branch tracks an upstream RELEASE, never upstream main. Its fork point is
+the nearest tag reachable from HEAD -- `git describe --tags --abbrev=0` -- and
+the Hanzo changes are exactly the commits after that tag. Images built from
+here are published to ghcr.io/hanzoai/.
